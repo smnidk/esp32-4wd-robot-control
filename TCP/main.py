@@ -1,493 +1,585 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-import numpy as np
-import cv2
-import socket
-import os
-import io
+
 import sys
+import os
+import math
 import time
-from threading import Timer, Thread
-from PIL import Image
-import string
+import cv2
 
-from Command import COMMAND as cmd
-from Thread import *
-from Client_Ui import Ui_Client
-from Video import *
+from threading import Thread
 
-from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import *
 from PyQt5.QtWidgets import *
 from PyQt5.QtGui import *
 
-def resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+from Command import COMMAND as cmd
+from Client_Ui import Ui_Client
+from Video import *
 
+
+# =========================
+# ПОТОКОБЕЗОПАСНЫЙ ВИДЖЕТ КАРТЫ РАДАРА С ЭМУЛЯЦИЕЙ ОДОМЕТРИИ
+# =========================
+class RadarMapWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.points = []       # Список глобальных точек: [(gx, gy), ...]
+        self.max_distance = 250
+        self.mutex = QMutex()
+
+        # Виртуальная одометрия (координаты робота на глобальной карте)
+        self.robot_x = 0.0     # в см
+        self.robot_y = 0.0     # в см
+        self.robot_angle = 90.0 # в градусах (90 - смотрит строго вверх)
+
+    def add_point(self, distance, sensor_angle=90):
+        # ВРЕМЕННЫЙ ТЕСТ: Выводим в консоль все входящие на карту точки
+        print(f"[MAP] Проверка точки: Дистанция={distance} см, Угол={sensor_angle}°")
+
+        if distance <= 4 or distance >= 250: 
+            print(f"[MAP] ❌ Точка отклонена фильтром диапазона (4 < {distance} < 250)")
+            return
+
+        self.mutex.lock()
+        relative_angle = sensor_angle - 90.0
+        global_rad = math.radians(self.robot_angle + relative_angle)
+
+        # Вычисляем глобальные координаты преграды
+        gx = round(self.robot_x + distance * math.cos(global_rad), 1)
+        gy = round(self.robot_y + distance * math.sin(global_rad), 1)
+
+        # ФИЛЬТР БЛИЖНИХ ДУБЛИКАТОВ
+        is_duplicate = False
+        for old_x, old_y in self.points:
+            if math.hypot(gx - old_x, gy - old_y) < 3.0: 
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            self.points.append((gx, gy))
+            if len(self.points) > 250: 
+                self.points.pop(0)
+            print(f"[MAP] 🟢 Точка успешно добавлена! Всего в базе: {len(self.points)}")
+        else:
+            print("[MAP] 🟡 Точка отклонена фильтром дубликатов (слишком близко к прошлой)")
+                
+        self.mutex.unlock()
+        self.update()
+
+    def move_robot(self, linear_speed, angular_speed):
+        """
+        Изменяет виртуальные координаты робота при движении.
+        Вызывается по таймеру, пока зажаты кнопки движения.
+        """
+        self.mutex.lock()
+        # Изменяем угол (поворот)
+        self.robot_angle += angular_speed
+        
+        # Считаем смещение по осям X и Y (вперед/назад)
+        rad = math.radians(self.robot_angle)
+        self.robot_x += linear_speed * math.cos(rad)
+        self.robot_y += linear_speed * math.sin(rad)
+        self.mutex.unlock()
+        
+        self.update()
+
+    def clear_map(self):
+        self.mutex.lock()
+        self.points.clear()
+        self.robot_x = 0.0
+        self.robot_y = 0.0
+        self.robot_angle = 90.0
+        self.mutex.unlock()
+        self.update()
+
+    def paintEvent(self, event):
+        with QPainter(self) as painter:
+            painter.setRenderHint(QPainter.Antialiasing)
+
+            # Фон
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(30, 30, 30))
+            painter.drawRoundedRect(self.rect(), 10, 10)
+
+            # Центр экрана (куда мы поместим текущую позицию робота)
+            cx = self.width() // 2
+            cy = int(self.height() * 0.75)
+
+            scale = min(self.width() / (self.max_distance * 2), self.height() / self.max_distance)
+
+            self.mutex.lock()
+            # Отрисовка сетки дальномера (теперь она привязана к текущему положению робота)
+            painter.setPen(QPen(QColor(0, 255, 0, 35), 1, Qt.DashLine))
+            for r_cm in [50, 100, 150, 200, 250]:
+                r_px = int(r_cm * scale)
+                painter.drawEllipse(QPoint(cx, cy), r_px, r_px)
+
+            # Отрисовка всех сохраненных глобальных точек относительно текущего положения робота
+            painter.setBrush(QBrush(QColor(255, 60, 60, 200)))
+            painter.setPen(Qt.NoPen)
+            
+            # Направление взгляда робота для трансформации координат
+            current_rad = math.radians(self.robot_angle - 90)
+            cos_a = math.cos(current_rad)
+            sin_a = math.sin(current_rad)
+
+            for gx, gy in self.points:
+                # Находим относительное смещение точки от робота в глобальных см
+                dx = gx - self.robot_x
+                dy = gy - self.robot_y
+
+                # Поворачиваем систему координат, чтобы карта крутилась вслед за роботом
+                rx = dx * cos_a + dy * sin_a
+                ry = -dx * sin_a + dy * cos_a
+
+                # Переводим в пиксели экрана
+                sx = cx + int(rx * scale)
+                sy = cy - int(ry * scale)
+
+                if self.rect().contains(sx, sy):
+                    painter.drawEllipse(sx - 2, sy - 2, 4, 4)
+
+            # Нанесение линий между близкими точками контура преграды
+            painter.setPen(QPen(QColor(255, 30, 30, 120), 1, Qt.SolidLine))
+            for i in range(len(self.points) - 1):
+                x1, y1 = self.points[i]
+                x2, y2 = self.points[i + 1]
+
+                if math.hypot(x1 - x2, y1 - y2) < 15.0:
+                    dx1, dy1 = x1 - self.robot_x, y1 - self.robot_y
+                    lx1 = dx1 * cos_a + dy1 * sin_a
+                    ly1 = -dx1 * sin_a + dy1 * cos_a
+                    ex1, ey1 = int(cx + lx1 * scale), int(cy - ly1 * scale)
+
+                    dx2, dy2 = x2 - self.robot_x, y2 - self.robot_y
+                    lx2 = dx2 * cos_a + dy2 * sin_a
+                    ly2 = -dx2 * sin_a + dy2 * cos_a
+                    ex2, ey2 = int(cx + lx2 * scale), int(cy - ly2 * scale)
+
+                    if (self.rect().contains(ex1, ey1) and self.rect().contains(ex2, ey2)):
+                        painter.drawLine(ex1, ey1, ex2, ey2)
+            self.mutex.unlock()
+
+            # Маркер направления робота (стрелочка/луч направления)
+            painter.setPen(QPen(QColor(0, 255, 0, 100), 1.5, Qt.SolidLine))
+            painter.drawLine(cx, cy, cx, cy - 30)
+
+            # Маркер самого робота в центре локальной системы координат
+            painter.setBrush(QBrush(QColor(0, 150, 255)))
+            painter.setPen(QPen(Qt.white, 1.5))
+            painter.drawEllipse(QPoint(cx, cy), 6, 6)
+
+
+# =========================
+# ОСНОВНОЕ ОКНО ПРИЛОЖЕНИЯ
+# =========================
 class mywindow(QWidget, Ui_Client):
     def __init__(self):
-        super(mywindow, self).__init__()
+        super().__init__()
         self.setupUi(self)
-        
-        self.endChar='\n'
-        self.intervalChar='#'
-        self.trackFlag=0; self.lightFlag=0; self.commandFlag=1
-        self.LED_Flag=0; self.Matrix_Flag=0
-        self.ws2812_number=4095
-        self.camera_angle=0
-        self.W_flag=0
 
-        self.car_image_path = resource_path('image/ESP32_4WD_Car.png')
-        self.original_car_pixmap = QPixmap(self.car_image_path)
-        self.current_video_source_pixmap = self.original_car_pixmap
-        
-        self.label_Video.mouseDoubleClickEvent = self.toggle_video_fullscreen
-        self.video_is_fullscreen = False
-
-        self.initial_capture_done = False
-        self.aspect_ratio = 0.0
-        self.widget_info = {}
-        
-        self.setAutoFillBackground(True)
-        palette = self.palette()
-        palette.setColor(QPalette.Window, QColor('black'))
-        self.setPalette(palette)
-        
-        self.IP.setText("")
-        self.IP.setPlaceholderText("IP Address")
-        
-        icon_path = resource_path('image/logo_Mini.png')
-        self.setWindowIcon(QIcon(icon_path))
-        self.update_video_pixmap()
-
-        ipValidator = QRegExpValidator(QRegExp('^((2[0-4]\d|25[0-5]|\d?\d|1\d{2})\.){3}(2[0-4]\d|25[0-5]|[01]?\d\d?)$'))
-        self.IP.setValidator(ipValidator)
-        
-        self.TCP=VideoStreaming()
-        self.servo1=90; self.servo2=90
-        
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.progress_Power.setMinimum(0); self.progress_Power.setMaximum(100)
-        self.progress_Power.setValue(100)
-        self.progress_Power.setTextVisible(True)
-        self.update_battery_style(100)
-        
-        self.HSlider_Servo1.setMinimum(0); self.HSlider_Servo1.setMaximum(180)
-        self.HSlider_Servo1.setValue(self.servo1)
-        self.VSlider_Servo2.setMinimum(80); self.VSlider_Servo2.setMaximum(180)
-        self.VSlider_Servo2.setValue(self.servo2)
-        self.HSlider_FineServo1.setMinimum(-10); self.HSlider_FineServo1.setMaximum(10); self.HSlider_FineServo1.setValue(0)
-        self.HSlider_FineServo2.setMinimum(-10); self.HSlider_FineServo2.setMaximum(10); self.HSlider_FineServo2.setValue(0)
-
-        self.connect_signals()
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.time)
-        
-    def update_battery_style(self, value):
-        if value > 60: color = "#4CAF50"
-        elif value > 30: color = "#FFC107"
-        else: color = "#F44336"
-        self.progress_Power.setStyleSheet(f"""
-            QProgressBar {{ border: 1px solid #777; border-radius: 4px; text-align: center; background-color: #DDD; color: black; }}
-            QProgressBar::chunk {{ background-color: {color}; border-radius: 3px; }}
+        # 1. СТИЛИЗАЦИЯ ИНТЕРФЕЙСА (Тёмная тема)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #1e1e24;
+                color: #e2e8f0;
+                font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+                font-size: 12px;
+            }
+            QPushButton {
+                background-color: #2d2d38;
+                border: 1px solid #4a4a5a;
+                border-radius: 6px;
+                color: #ffffff;
+                font-weight: bold;
+                padding: 4px;
+            }
+            QPushButton:hover {
+                background-color: #3f3f52;
+                border: 1px solid #00ff66;
+            }
+            QPushButton:pressed {
+                background-color: #1a1a22;
+                color: #00ff66;
+            }
+            QLineEdit {
+                background-color: #111116;
+                border: 1px solid #4a4a5a;
+                border-radius: 4px;
+                color: #00ff66;
+                padding: 4px;
+                font-weight: bold;
+            }
         """)
-        
-    def showEvent(self, event):
-        if not self.initial_capture_done:
-            self.original_size = self.size()
-            self.aspect_ratio = self.original_size.width() / self.original_size.height()
-            self.widget_info = {}
-            for widget in self.findChildren(QtWidgets.QWidget):
-                if widget is self: continue
-                font = widget.font()
-                font_size = font.pointSize() if font.pointSize() > 0 else font.pixelSize()
-                if font_size <= 0: font_size = 9
-                self.widget_info[widget] = { 'geometry': widget.geometry(), 'font_size': font_size }
-            self.initial_capture_done = True
-        super(mywindow, self).showEvent(event)
 
-    def toggle_video_fullscreen(self, event=None):
-        self.video_is_fullscreen = not self.video_is_fullscreen
-        
-        for widget in self.findChildren(QtWidgets.QWidget):
-            if widget.parent() is self and widget is not self.label_Video:
-                widget.setVisible(not self.video_is_fullscreen)
-        
-        self.resizeEvent(QResizeEvent(self.size(), self.size()))
+        # 2. РАДИКАЛЬНОЕ УДАЛЕНИЕ НАДПИСИ FREENOVE И ПЕРЕИМЕНОВАНИЕ
+        self.setWindowTitle("ESP32 Robot Control Station")
+
+        for widget in self.findChildren(QLabel):
+            if "Freenove" in widget.text():
+                widget.setText("")
+                widget.hide()
+
+        # 3. ОБЩАЯ СЕТКА МАКЕТА
+        MARGIN = 15
+        WIN_W, WIN_H = 820, 660
+
+        self.resize(WIN_W, WIN_H)
+        self.setMinimumSize(WIN_W, WIN_H)
+
+        TOP_Y, TOP_H = 45, 330               # верхняя зона: видео + радар
+        LEFT_X, LEFT_W = MARGIN, 415          # левая колонка
+        RIGHT_X = LEFT_X + LEFT_W + MARGIN    # = 445
+        RIGHT_W = WIN_W - RIGHT_X - MARGIN    # = 360
+
+        ROW2_Y, ROW2_H = TOP_Y + TOP_H + MARGIN, 35     # кнопки записи/подключения
+        ROW3_Y = ROW2_Y + ROW2_H + 20                    # D-pad'ы
+        ROW4_Y = ROW3_Y + 140                            # слайдеры / батарея
+
+        # Заголовок по центру окна (если есть в UI)
+        if hasattr(self, 'label_Title'):
+            self.label_Title.setGeometry(MARGIN, 8, WIN_W - 2 * MARGIN, 28)
+            self.label_Title.setAlignment(Qt.AlignCenter)
+            self.label_Title.setText("ESP32 AUTOMOTIVE ROBOT SYSTEM")
+            self.label_Title.setStyleSheet("font-size: 14px; font-weight: bold; color: #007acc; letter-spacing: 1px;")
+
+        # 4. ВЕРХНЯЯ ЗОНА: ВИДЕО (слева) + РАДАР (справа)
+        self.label_Video.setGeometry(LEFT_X, TOP_Y, LEFT_W, TOP_H)
+
+        self.radar_base_geom = (RIGHT_X, TOP_Y, RIGHT_W, TOP_H)
+        self.radar_map = RadarMapWidget(self)
+        self.radar_map.setGeometry(*self.radar_base_geom)
+        self.radar_map.show()
+
+        # 5. СТРОКА УПРАВЛЕНИЯ И ИСПРАВЛЕННАЯ КНОПКА ЗАПИСИ
+        self.Btn_Video.setGeometry(LEFT_X + 210, ROW2_Y, LEFT_W - 210, ROW2_H)
+
+        # Центрируем уменьшенную кнопку записи (длина 180px) относительно правой панели радара
+        rec_w = 180
+        rec_x = RIGHT_X + (RIGHT_W - rec_w) // 2
+        self.Btn_Record = QPushButton("Начать запись", self)
+        self.Btn_Record.setObjectName("Btn_Record")
+        self.Btn_Record.setGeometry(rec_x, ROW2_Y, rec_w, ROW2_H)
+
+        self.IP.setText("192.168.4.1")
+        self.IP.setGeometry(LEFT_X, ROW2_Y, 95, ROW2_H)
+
+        self.Btn_Connect.setGeometry(LEFT_X + 100, ROW2_Y, 110, ROW2_H)
+
+        # Отключаем ненужный функционал базовой платформы
+        self.clear_led_interface()
+        self.Btn_Buzzer.hide()
+        self.Btn_Buzzer.setEnabled(False)
+
+        # 6. D-PAD ДВИЖЕНИЯ (слева)
+        cx1 = LEFT_X + LEFT_W // 2
+        FB_W, FB_H = 100, 35
+        TURN_W = 130
+
+        self.Btn_ForWard.setGeometry(cx1 - FB_W // 2, ROW3_Y, FB_W, FB_H)
+        self.Btn_Turn_Left.setGeometry(cx1 - FB_W // 2 - 10 - TURN_W, ROW3_Y + 45, TURN_W, FB_H)
+        self.Btn_Turn_Right.setGeometry(cx1 + FB_W // 2 + 10, ROW3_Y + 45, TURN_W, FB_H)
+        self.Btn_BackWard.setGeometry(cx1 - FB_W // 2, ROW3_Y + 90, FB_W, FB_H)
+
+        # 7. D-PAD КАМЕРЫ (справа)
+        cx2 = RIGHT_X + RIGHT_W // 2
+        CAM_W, CAM_H = 90, 32
+
+        self.Btn_Up.setGeometry(cx2 - CAM_W // 2, ROW3_Y, CAM_W, CAM_H)
+        self.Btn_Left.setGeometry(cx2 - CAM_W // 2 - 10 - CAM_W, ROW3_Y + 42, CAM_W, CAM_H)
+        self.Btn_Home.setGeometry(cx2 - CAM_W // 2, ROW3_Y + 42, CAM_W, CAM_H)
+        self.Btn_Right.setGeometry(cx2 + CAM_W // 2 + 10, ROW3_Y + 42, CAM_W, CAM_H)
+        self.Btn_Down.setGeometry(cx2 - CAM_W // 2, ROW3_Y + 84, CAM_W, CAM_H)
+
+        self.servo1 = 90
+        self.servo2 = 90
+
+        # 8. НИЖНЯЯ ЗОНА: ИСПРАВЛЕННЫЙ АККУРАТНЫЙ ИНДИКАТОР БАТАРЕИ
+        # Длина уменьшена до 180px, расположен симметрично под D-pad'ом движения
+        bat_w = 180
+        bat_x = cx1 - (bat_w // 2)
+
+        self.progress_Power.setGeometry(bat_x, ROW4_Y, bat_w, 35)
+        self.progress_Power.setTextVisible(True)
+        self.progress_Power.setAlignment(Qt.AlignCenter)
+        self.progress_Power.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #555566;
+                border-radius: 6px;
+                background-color: #111116;
+                color: #ffffff;
+                font-weight: bold;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00cc44, stop:1 #00ff66);
+                border-radius: 4px;
+                margin: 1px;
+            }
+        """)
+
+        # Точное позиционирование графического наконечника ("плюса") батарейки справа
+        self.battery_tip = QLabel(self)
+        self.battery_tip.setGeometry(bat_x + bat_w, ROW4_Y + (35 - 19) // 2, 8, 19)
+        self.battery_tip.setStyleSheet("background-color: #555566; border-radius: 1px;")
+        self.battery_tip.show()
+
+        # Горизонтальный слайдер
+        self.HSlider_Servo1.setGeometry(cx2 - CAM_W // 2 - 10 - CAM_W, ROW4_Y, 210, 28)
+        self.HSlider_Servo1.setValue(self.servo1)
+
+        self.label_Servo1.setGeometry(cx2 - CAM_W // 2 - 10 - CAM_W + 220, ROW4_Y - 4, 70, 28)
+
+        # Вертикальный слайдер
+        self.VSlider_Servo2.setGeometry(WIN_W - MARGIN - 20, ROW3_Y, 20, 166)
+        self.VSlider_Servo2.setValue(self.servo2)
+
+        self.label_Servo2.setGeometry(WIN_W - MARGIN - 70, ROW3_Y - 5, 50, 26)
+        self.label_Servo2.setAlignment(Qt.AlignCenter)
+
+        # Системные переменные
+        self.running = True
+        self.original_size = self.size()
+        self.aspect_ratio = self.original_size.width() / self.original_size.height()
+        self.current_linear_speed = 0.0
+        self.current_angular_speed = 0.0
+
+        self.TCP = VideoStreaming()
+        self.connect_signals()
+
+        # Инициализация таймеров и потоков
+        self.odometry_timer = QTimer(self)
+        self.odometry_timer.timeout.connect(self.update_odometry)
+        self.odometry_timer.start(50)
+
+        self.video_thread = Thread(target=self.update_video_loop, daemon=True)
+        self.video_thread.start()
+
+    def clear_led_interface(self):
+        led_widgets = [
+            'Led_Module', 'RGB', 'Color_R', 'Color_G', 'Color_B', 'Color_W', 'W',
+            'checkBox_Led_Mode1', 'checkBox_Led_Mode2', 'checkBox_Led_Mode3', 'checkBox_Led_Mode4',
+            'checkBox_Matrix_Mode1', 'checkBox_Matrix_Mode2', 'checkBox_Matrix_Mode3', 'checkBox_Matrix_Mode4'
+        ]
+        for w_name in led_widgets:
+            if hasattr(self, w_name):
+                w = getattr(self, w_name)
+                w.hide()
+                w.setEnabled(False)
+
+        extra_control_widgets = ['horizontalLayoutWidget_2', 'horizontalLayoutWidget_3']
+        for w_name in extra_control_widgets:
+            if hasattr(self, w_name):
+                w = getattr(self, w_name)
+                w.hide()
+                w.setEnabled(False)
+
+        camera_control_widgets = ['Btn_Cam_Left', 'Btn_Cam_Origin', 'Btn_Cam_Right']
+        for w_name in camera_control_widgets:
+            if hasattr(self, w_name):
+                w = getattr(self, w_name)
+                w.hide()
+                w.setEnabled(False)
+
+        for i in range(1, 13):
+            if hasattr(self, f"L{i}"):
+                getattr(self, f"L{i}").hide()
+
+    def connect_signals(self):
+        self.Btn_ForWard.pressed.connect(lambda: self.set_movement(4.0, 0.0, 2500, 2500, 2500, 2500))
+        self.Btn_ForWard.released.connect(self.stop_movement)
+
+        self.Btn_BackWard.pressed.connect(lambda: self.set_movement(-4.0, 0.0, -2500, -2500, -2500, -2500))
+        self.Btn_BackWard.released.connect(self.stop_movement)
+
+        self.Btn_Turn_Left.pressed.connect(lambda: self.set_movement(0.0, 5.0, -2500, -2500, 2500, 2500))
+        self.Btn_Turn_Left.released.connect(self.stop_movement)
+
+        self.Btn_Turn_Right.pressed.connect(lambda: self.set_movement(0.0, -5.0, 2500, 2500, -2500, -2500))
+        self.Btn_Turn_Right.released.connect(self.stop_movement)
+
+        self.Btn_Connect.clicked.connect(self.toggle_connection)
+        self.Btn_Video.clicked.connect(self.toggle_video)
+        self.Btn_Record.clicked.connect(self.toggle_recording)
+
+        self.HSlider_Servo1.valueChanged.connect(self.on_servo_change)
+        self.VSlider_Servo2.valueChanged.connect(self.on_servo_change)
+
+        self.Btn_Home.clicked.connect(self.reset_servos)
+        self.Btn_Up.clicked.connect(lambda: self.adjust_servo(0, 10))
+        self.Btn_Down.clicked.connect(lambda: self.adjust_servo(0, -10))
+        self.Btn_Left.clicked.connect(lambda: self.adjust_servo(1, -10))
+        self.Btn_Right.clicked.connect(lambda: self.adjust_servo(1, 10))
+
+    def set_movement(self, lin, ang, m1, m2, m3, m4):
+        self.current_linear_speed = lin
+        self.current_angular_speed = ang
+        self.TCP.sendData(f"{cmd.CMD_MOTOR}#{m1}#{m2}#{m3}#{m4}\n")
+
+    def stop_movement(self):
+        self.current_linear_speed = 0.0
+        self.current_angular_speed = 0.0
+        self.TCP.sendData(f"{cmd.CMD_MOTOR}#0#0#0#0\n")
+
+    def update_odometry(self):
+        if self.current_linear_speed != 0.0 or self.current_angular_speed != 0.0:
+            self.radar_map.move_robot(self.current_linear_speed, self.current_angular_speed)
+
+    def toggle_connection(self):
+        if "Подключить" in self.Btn_Connect.text() or "Connect" in self.Btn_Connect.text():
+            ip = self.IP.text()
+            if ip:
+                self.radar_map.clear_map()
+                self.TCP.StartTcpClient(ip)
+                self.recv_thread = Thread(target=self.recv_data_loop, args=(ip,), daemon=True)
+                self.recv_thread.start()
+                self.Btn_Connect.setText("Отключить")
+        else:
+            self.Btn_Connect.setText("Подключить")
+            self.TCP.StopTcpcClient()
+
+    def toggle_video(self):
+        if "Открыть" in self.Btn_Video.text() or "Open" in self.Btn_Video.text():
+            self.Btn_Video.setText("Закрыть видео")
+            if "Отключить" in self.Btn_Connect.text():
+                self.TCP.sendData(f"{cmd.CMD_VIDEO}#1\n")
+                Thread(target=self.TCP.streaming, args=(self.IP.text(),), daemon=True).start()
+        else:
+            self.Btn_Video.setText("Открыть видео")
+            if "Отключить" in self.Btn_Connect.text():
+                self.TCP.sendData(f"{cmd.CMD_VIDEO}#0\n")
+            if self.TCP.recording:
+                self.toggle_recording()
+
+    def toggle_recording(self):
+        if "Начать" in self.Btn_Record.text() or "Start" in self.Btn_Record.text():
+            if "Отключить" in self.Btn_Connect.text():
+                output_path = self.TCP.start_recording()
+                self.Btn_Record.setText("Остановить запись")
+                print(f"Запись начата: {output_path}")
+            else:
+                QMessageBox.information(self, "Запись", "Сначала подключитесь к роботу")
+        else:
+            output_path = self.TCP.stop_recording()
+            self.Btn_Record.setText("Начать запись")
+            if output_path:
+                print(f"Запись остановлена: {output_path}")
+
+    def recv_data_loop(self, ip):
+        self.TCP.socket1_connect(ip)
+
+        def battery_ping():
+            while "Отключить" in self.Btn_Connect.text():
+                self.TCP.sendData(f"{cmd.CMD_POWER}\n")
+                time.sleep(3)
+        Thread(target=battery_ping, daemon=True).start()
+
+        rest_buffer = ""
+        while "Отключить" in self.Btn_Connect.text():
+            try:
+                data = self.TCP.recvData()
+                if not data:
+                    break
+
+                complete_data = rest_buffer + data
+                lines = complete_data.split("\n")
+                rest_buffer = lines.pop() if lines[-1] != "" else ""
+
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    payload = line.split("#")
+
+                    if "CMD_DISTANCE" in line and len(payload) > 1:
+                        try:
+                            dist = int(payload[1])
+                            angle = self.HSlider_Servo1.value()
+                            self.radar_map.add_point(dist, angle)
+                        except:
+                            pass
+
+                    elif "CMD_POWER" in line and len(payload) > 1:
+                        try:
+                            v = float(payload[1])
+                            percentage = int(((v - 7.0) / 1.4) * 100)
+                            val = max(0, min(percentage, 100))
+
+                            QMetaObject.invokeMethod(self.progress_Power, "setValue", Qt.QueuedConnection, Q_ARG(int, val))
+                            if val < 20:
+                                color_qss = "QProgressBar::chunk { background-color: #ff3333; border-radius: 4px; }"
+                            elif val < 50:
+                                color_qss = "QProgressBar::chunk { background-color: #ffaa00; border-radius: 4px; }"
+                            else:
+                                color_qss = "QProgressBar::chunk { background-color: #00ff66; border-radius: 4px; }"
+
+                            self.progress_Power.setStyleSheet("""
+                                QProgressBar { border: 2px solid #555566; border-radius: 6px; background-color: #111116; color: white; font-weight: bold; text-align: center; }
+                            """ + color_qss)
+                        except:
+                            pass
+            except:
+                break
+
+    def adjust_servo(self, is_axis_x, diff):
+        if is_axis_x:
+            self.servo1 = max(0, min(180, self.servo1 + diff))
+            self.HSlider_Servo1.setValue(self.servo1)
+        else:
+            self.servo2 = max(80, min(180, self.servo2 + diff))
+            self.VSlider_Servo2.setValue(self.servo2)
+
+    def reset_servos(self):
+        self.servo1, self.servo2 = 90, 90
+        self.HSlider_Servo1.setValue(self.servo1)
+        self.VSlider_Servo2.setValue(self.servo2)
+
+    def on_servo_change(self):
+        self.servo1 = self.HSlider_Servo1.value()
+        self.servo2 = self.VSlider_Servo2.value()
+        self.label_Servo1.setText(str(self.servo1))
+        self.label_Servo2.setText(str(self.servo2))
+        self.TCP.sendData(f"{cmd.CMD_SERVO}#0#{180 - self.servo1}\n")
+        self.TCP.sendData(f"{cmd.CMD_SERVO}#1#{self.servo2}\n")
+
+    def update_video_loop(self):
+        while self.running:
+            try:
+                if not self.TCP.video_Flag and self.TCP.image is not None:
+                    cv2.flip(self.TCP.image, -1, self.TCP.image)
+                    img = QImage(self.TCP.image.data, self.TCP.image.shape[1], self.TCP.image.shape[0], self.TCP.image.strides[0], QImage.Format_BGR888)
+                    pix = QPixmap.fromImage(img)
+                    QMetaObject.invokeMethod(self.label_Video, "setPixmap", Qt.QueuedConnection, Q_ARG(QPixmap, pix.scaled(self.label_Video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)))
+                    self.TCP.video_Flag = True
+            except:
+                pass
+            time.sleep(0.03)
 
     def resizeEvent(self, event):
-        super(mywindow, self).resizeEvent(event)
-        if not self.initial_capture_done:
-            return
+        if float(self.width()) / self.height() != self.aspect_ratio:
+            self.resize(self.width(), int(self.width() / self.aspect_ratio))
 
-        if self.video_is_fullscreen:
-            self.label_Video.setGeometry(self.rect())
-            self.update_video_pixmap()
-            return
-        
-        window_size = self.size()
-        w, h = window_size.width(), window_size.height()
-        target_h = w / self.aspect_ratio
-        
-        if target_h <= h:
-            content_w, content_h = w, int(target_h)
-            content_x, content_y = 0, (h - content_h) // 2
-        else:
-            target_w = h * self.aspect_ratio
-            content_w, content_h = int(target_w), h
-            content_x, content_y = (w - content_w) // 2, 0
-            
-        content_rect = QRect(content_x, content_y, content_w, content_h)
-        ratio = content_rect.width() / self.original_size.width()
-        
-        for widget, info in self.widget_info.items():
-            original_geom = info['geometry']
-            
-            if widget.parentWidget() is self:
-                new_x = content_rect.x() + int(original_geom.x() * ratio)
-                new_y = content_rect.y() + int(original_geom.y() * ratio)
-            else:
-                new_x = int(original_geom.x() * ratio)
-                new_y = int(original_geom.y() * ratio)
+        w_scale = self.width() / self.original_size.width()
+        h_scale = self.height() / self.original_size.height()
 
-            new_w, new_h = int(original_geom.width() * ratio), int(original_geom.height() * ratio)
-            widget.setGeometry(new_x, new_y, new_w, new_h)
-            
-            try:
-                original_font_size = info['font_size']
-                font = widget.font()
-                new_font_size = int(original_font_size * ratio)
-                if new_font_size > 1: font.setPointSize(new_font_size); widget.setFont(font)
-            except: pass
+        rx, ry, rw, rh = self.radar_base_geom
+        self.radar_map.setGeometry(int(rx * w_scale), int(ry * h_scale), int(rw * w_scale), int(rh * h_scale))
 
-            if isinstance(widget, QCheckBox):
-                indicator_size = max(10, int(13 * ratio))
-                widget.setStyleSheet(f"QCheckBox::indicator {{ width: {indicator_size}px; height: {indicator_size}px; }}")
-
-        self.update_video_pixmap()
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape and self.video_is_fullscreen:
-            self.toggle_video_fullscreen()
-            return
-
-        if event.key() == Qt.Key_Escape and self.isFullScreen():
-            self.showNormal()
-            return
-            
-        if(event.key() == Qt.Key_Up): 
-            self.on_btn_Up()
-        elif(event.key() == Qt.Key_Left): 
-            self.on_btn_Left()
-        elif(event.key() == Qt.Key_Down): 
-            self.on_btn_Down()
-        elif(event.key() == Qt.Key_Right): 
-            self.on_btn_Right()
-        elif(event.key() == Qt.Key_Home): 
-            self.on_btn_Home()
-        elif(event.key() == Qt.Key_R): 
-            self.on_btn_Light()
-        elif(event.key() == Qt.Key_T): 
-            self.on_btn_Track()
-        elif(event.key() == Qt.Key_C): 
-            self.on_btn_Connect()
-        elif(event.key() == Qt.Key_V): 
-            self.on_btn_video()
-        if event.isAutoRepeat(): return
-        if event.key() == Qt.Key_W: 
-            self.on_btn_ForWard(); 
-            self.Key_W=True
-        elif event.key() == Qt.Key_S: 
-            self.on_btn_BackWard(); 
-            self.Key_S=True
-        elif event.key() == Qt.Key_A: 
-            self.on_btn_Turn_Left(); 
-            self.Key_A=True
-        elif event.key() == Qt.Key_D: 
-            self.on_btn_Turn_Right(); 
-            self.Key_D=True  
-        elif event.key() == Qt.Key_Space: 
-            self.on_btn_Buzzer(); 
-            self.Key_Space=True
-    
-    def connect_signals(self):
-        self.HSlider_Servo1.valueChanged.connect(self.Change_Left_Right)
-        self.VSlider_Servo2.valueChanged.connect(self.Change_Up_Down)
-        self.HSlider_FineServo1.valueChanged.connect(self.Fine_Tune_Left_Right)
-        self.HSlider_FineServo2.valueChanged.connect(self.Fine_Tune_Up_Down)
-        self.Led_Module.clicked.connect(lambda: self.LedChange(self.Led_Module))
-        self.RGB.clicked.connect(lambda: self.LedChange(self.RGB))
-        self.checkBox_Led_Mode1.stateChanged.connect(lambda: self.LedChange(self.checkBox_Led_Mode1))
-        self.checkBox_Led_Mode2.stateChanged.connect(lambda: self.LedChange(self.checkBox_Led_Mode2))
-        self.checkBox_Led_Mode3.stateChanged.connect(lambda: self.LedChange(self.checkBox_Led_Mode3))
-        self.checkBox_Led_Mode4.stateChanged.connect(lambda: self.LedChange(self.checkBox_Led_Mode4))
-        self.checkBox_Matrix_Mode1.stateChanged.connect(lambda: self.MatrixChange(self.checkBox_Matrix_Mode1))
-        self.checkBox_Matrix_Mode2.stateChanged.connect(lambda: self.MatrixChange(self.checkBox_Matrix_Mode2))
-        self.checkBox_Matrix_Mode3.stateChanged.connect(lambda: self.MatrixChange(self.checkBox_Matrix_Mode3))
-        self.checkBox_Matrix_Mode4.stateChanged.connect(lambda: self.MatrixChange(self.checkBox_Matrix_Mode4))
-        self.Track.clicked.connect(self.on_btn_Track)
-        self.Light.clicked.connect(self.on_btn_Light)
-        self.Btn_ForWard.pressed.connect(self.on_btn_ForWard)
-        self.Btn_ForWard.released.connect(self.on_btn_Stop)
-        self.Btn_Turn_Left.pressed.connect(self.on_btn_Turn_Left)
-        self.Btn_Turn_Left.released.connect(self.on_btn_Stop)
-        self.Btn_BackWard.pressed.connect(self.on_btn_BackWard)
-        self.Btn_BackWard.released.connect(self.on_btn_Stop)
-        self.Btn_Turn_Right.pressed.connect(self.on_btn_Turn_Right)
-        self.Btn_Turn_Right.released.connect(self.on_btn_Stop)
-        self.Btn_Video.clicked.connect(self.on_btn_video)
-        self.Btn_Up.clicked.connect(self.on_btn_Up)
-        self.Btn_Left.clicked.connect(self.on_btn_Left)
-        self.Btn_Down.clicked.connect(self.on_btn_Down)
-        self.Btn_Home.clicked.connect(self.on_btn_Home)
-        self.Btn_Right.clicked.connect(self.on_btn_Right)
-        self.Btn_Buzzer.pressed.connect(self.on_btn_Buzzer)
-        self.Btn_Buzzer.released.connect(self.on_btn_Buzzer)
-        self.Btn_Connect.clicked.connect(self.on_btn_Connect)
-        self.Btn_Cam_Left.clicked.connect(self.on_btn_Cam_Left)
-        self.Btn_Cam_Right.clicked.connect(self.on_btn_Cam_Right)
-        self.Btn_Cam_Origin.clicked.connect(self.on_btn_Cam_Origin)
-        self.Color_W.textChanged.connect(self.WS2812_Text_Change)
-        for i in range(1,13): getattr(self,f"L{i}").clicked.connect(self.WS2812_Calculate)
-        self.W.clicked.connect(self.ALL_Click)
-    
-    def update_video_pixmap(self):
-        pixmap = self.current_video_source_pixmap
-        if pixmap and not pixmap.isNull():
-            self.label_Video.setPixmap(pixmap.scaled(self.label_Video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-    
-    def keyReleaseEvent(self, event):
-        key_map = {Qt.Key_W: 'Key_W', Qt.Key_S: 'Key_S', Qt.Key_A: 'Key_A', Qt.Key_D: 'Key_D'}
-        if event.key() in key_map and not event.isAutoRepeat() and getattr(self, key_map[event.key()], False):
-            self.on_btn_Stop(); setattr(self, key_map[event.key()], False)
-        if event.key() == Qt.Key_Space and not event.isAutoRepeat() and getattr(self, 'Key_Space', False):
-            self.on_btn_Buzzer(); self.Key_Space = False
-    
-    def on_btn_Connect(self):
-        if self.Btn_Connect.text() == "Connect":
-            self.h = self.IP.text()
-            if self.h:
-                self.TCP.StartTcpClient(self.h)
-                try:
-                    self.streaming = Thread(target=self.TCP.streaming, args=(self.h,))
-                    self.streaming.start()
-                    self.recv=Thread(target=self.recvmassage)
-                    self.recv.start()
-                    self.Btn_Connect.setText( "Disconnect")
-                    print ('Server address:'+str(self.h)+'\n')
-                except Exception as e: print(f"Connection Error: {e}")
-        else:
-            self.Btn_Connect.setText("Connect")
-            self.Btn_Video.setText('Open Video')
-            self.TCP.sendData(cmd.CMD_VIDEO + self.intervalChar + '0' + self.endChar)
-            self.current_video_source_pixmap = self.original_car_pixmap
-            self.update_video_pixmap()
-            try:
-                if hasattr(self, 'streaming'): stop_thread(self.streaming)
-                if hasattr(self, 'timer'): self.timer.stop()
-                if hasattr(self, 'power'): stop_thread(self.power)
-                if hasattr(self, 'recv'): stop_thread(self.recv)
-            except: pass
-            self.TCP.StopTcpcClient()
-    
-    def on_btn_video(self):
-        if self.Btn_Video.text()=='Open Video':
-            self.timer.start(10)
-            self.Btn_Video.setText('Close Video')
-            if self.Btn_Connect.text()=="Disconnect": self.TCP.sendData(cmd.CMD_VIDEO+self.intervalChar+'1'+self.endChar)
-        else:
-            self.timer.stop()
-            self.Btn_Video.setText('Open Video')
-            if self.Btn_Connect.text() == "Disconnect": self.TCP.sendData(cmd.CMD_VIDEO + self.intervalChar + '0' + self.endChar)
-            self.current_video_source_pixmap = self.original_car_pixmap
-            self.update_video_pixmap()
-    
-    def on_btn_ForWard(self):
-        if self.commandFlag: self.TCP.sendData(f"{cmd.CMD_MOTOR}#2500#2500#2500#2500\n")
-    
-    def on_btn_Turn_Left(self):
-        if self.commandFlag: self.TCP.sendData(f"{cmd.CMD_MOTOR}#-2500#-2500#2500#2500\n")
-    
-    def on_btn_BackWard(self):
-        if self.commandFlag: self.TCP.sendData(f"{cmd.CMD_MOTOR}#-2500#-2500#-2500#-2500\n")
-    
-    def on_btn_Turn_Right(self):
-        if self.commandFlag: self.TCP.sendData(f"{cmd.CMD_MOTOR}#2500#2500#-2500#-2500\n")
-    
-    def on_btn_Stop(self):
-        if self.commandFlag: self.TCP.sendData(f"{cmd.CMD_MOTOR}#0#0#0#0\n")
-    
-    def on_btn_Buzzer(self):
-        if self.commandFlag:
-            if self.Btn_Buzzer.text()=='Buzzer': self.TCP.sendData(f"{cmd.CMD_BUZZER}#1#2000\n"); self.Btn_Buzzer.setText('Noise')
-            else: self.TCP.sendData(f"{cmd.CMD_BUZZER}#0\n"); self.Btn_Buzzer.setText('Buzzer')
-    
-    def on_btn_Up(self): 
-        self.servo2 = min(180, self.servo2 + 10); 
-        self.VSlider_Servo2.setValue(self.servo2)
-    
-    def on_btn_Left(self): 
-        self.servo1 = max(0, self.servo1 - 10); 
-        self.HSlider_Servo1.setValue(self.servo1)
-    
-    def on_btn_Down(self): 
-        self.servo2 = max(80, self.servo2 - 10); 
-        self.VSlider_Servo2.setValue(self.servo2)
-    
-    def on_btn_Right(self): 
-        self.servo1 = min(180, self.servo1 + 10); 
-        self.HSlider_Servo1.setValue(self.servo1)
-    
-    def on_btn_Home(self): 
-        self.servo1, self.servo2 = 90, 90; 
-        self.HSlider_Servo1.setValue(self.servo1); 
-        self.VSlider_Servo2.setValue(self.servo2)
-    
-    def on_btn_Cam_Left(self): 
-        self.camera_angle = (self.camera_angle - 90) % 360
-    
-    def on_btn_Cam_Right(self): 
-        self.camera_angle = (self.camera_angle + 90) % 360
-    
-    def on_btn_Cam_Origin(self): 
-        self.camera_angle = 0
-    
-    def Change_Left_Right(self): 
-        self.servo1=self.HSlider_Servo1.value(); 
-        self.label_Servo1.setText(f"{self.servo1}"); 
-        self.send_servo_command()
-    
-    def Change_Up_Down(self): 
-        self.servo2=self.VSlider_Servo2.value();
-        self.label_Servo2.setText(f"{self.servo2}");
-        self.send_servo_command()
-    
-    def Fine_Tune_Left_Right(self): 
-        self.label_FineServo1.setText(str(self.HSlider_FineServo1.value())); 
-        self.send_servo_command()
-    
-    def Fine_Tune_Up_Down(self): 
-        self.label_FineServo2.setText(str(self.HSlider_FineServo2.value())); 
-        self.send_servo_command()
-    
-    def send_servo_command(self):
-        if self.commandFlag:
-            s1_val = self.servo1 + self.HSlider_FineServo1.value()
-            s2_val = self.servo2 + self.HSlider_FineServo2.value()
-            self.TCP.sendData(f"{cmd.CMD_SERVO}#0#{180-s1_val}\n")
-            self.TCP.sendData(f"{cmd.CMD_SERVO}#1#{s2_val}\n")
-    
-    def on_btn_Track(self):
-        if self.commandFlag:
-            self.trackFlag = 1 - self.trackFlag; 
-            self.lightFlag = 0; 
-            self.Light.setText("Light off"); 
-            self.Track.setText("Track on" if self.trackFlag else "Track off"); 
-            self.TCP.sendData(f"{cmd.CMD_TRACK}#{self.trackFlag}\n")
-    
-    def on_btn_Light(self):
-        if self.commandFlag:
-            self.lightFlag = 1 - self.lightFlag; 
-            self.trackFlag = 0; 
-            self.Track.setText("Track off");
-            self.Light.setText("Light on" if self.lightFlag else "Light off"); 
-            self.TCP.sendData(f"{cmd.CMD_LIGHT}#{self.lightFlag}\n")
-    
-    def WS2812_Text_Change(self):
-        try: w = int(self.Color_W.text()) if self.Color_W.text() else 0
-        except ValueError: w = 0
-        w = min(max(w, 0), 4095)
-        for i in range(1, 13): getattr(self, f"L{i}").setChecked(bool(w&(1<<(i-1))))
-    
-    def WS2812_Calculate(self):
-        num = sum(1 << (i-1) for i in range(1, 13) if getattr(self, f"L{i}").isChecked())
-        self.ws2812_number = num
-        self.Color_W.setText(str(num))
-    
-    def ALL_Click(self):
-        self.W_flag = not self.W_flag
-        is_checked = self.W_flag == 0
-        for i in range(1, 13): getattr(self, f"L{i}").setChecked(is_checked)
-        self.WS2812_Calculate()
-    
-    def LedChange(self, b):
-        if b is self.RGB:
-            color = QColorDialog.getColor();
-            if color.isValid(): self.Color_R.setText(str(color.red())); self.Color_G.setText(str(color.green())); self.Color_B.setText(str(color.blue()))
-        elif b is self.Led_Module and self.commandFlag:
-            self.TCP.sendData(f"{cmd.CMD_LED}#{self.Color_W.text()}#{self.Color_R.text()}#{self.Color_G.text()}#{self.Color_B.text()}\n")
-        elif b.isCheckable() and self.commandFlag:
-            checks, mode_map = ({self.checkBox_Led_Mode1, self.checkBox_Led_Mode2, self.checkBox_Led_Mode3, self.checkBox_Led_Mode4},
-                              {self.checkBox_Led_Mode1: "2", self.checkBox_Led_Mode2: "3", self.checkBox_Led_Mode3: "4", self.checkBox_Led_Mode4: "5"})
-            if b in checks:
-                if b.isChecked(): [chk.setChecked(False) for chk in checks if chk is not b]; self.TCP.sendData(f"{cmd.CMD_LED_MOD}#{mode_map[b]}\n")
-                else: self.TCP.sendData(f"{cmd.CMD_LED_MOD}#0\n")
-    
-    def MatrixChange(self, b):
-        if self.commandFlag:
-            checks, mode_map = ({self.checkBox_Matrix_Mode1, self.checkBox_Matrix_Mode2, self.checkBox_Matrix_Mode3, self.checkBox_Matrix_Mode4},
-                              {self.checkBox_Matrix_Mode1: "1", self.checkBox_Matrix_Mode2: "2", self.checkBox_Matrix_Mode3: "3", self.checkBox_Matrix_Mode4: "6"})
-            if b in checks:
-                if b.isChecked(): [chk.setChecked(False) for chk in checks if chk is not b]; self.TCP.sendData(f"{cmd.CMD_MATRIX_MOD}#{mode_map[b]}\n")
-                else: self.TCP.sendData(f"{cmd.CMD_MATRIX_MOD}#0\n")
-    
-    def time(self):
-        try:
-            if not self.TCP.video_Flag:
-                q_img = QImage(self.TCP.image.data, self.TCP.image.shape[1], self.TCP.image.shape[0], self.TCP.image.strides[0], QImage.Format_BGR888)
-                transform = QTransform().rotate(self.camera_angle)
-                rotated_img = q_img.transformed(transform, Qt.SmoothTransformation)
-                self.current_video_source_pixmap = QPixmap.fromImage(rotated_img)
-                self.update_video_pixmap()
-                self.TCP.video_Flag = True
-        except Exception as e: 
-            self.TCP.video_Flag = True
-    
     def closeEvent(self, event):
-        self.timer.stop(); self.TCP.StopTcpcClient()
+        self.running = False
         try:
-            if hasattr(self, 'streaming'): stop_thread(self.streaming)
-            if hasattr(self, 'power'): stop_thread(self.power)
-            if hasattr(self, 'recv'): stop_thread(self.recv)
-        except: pass
-        event.accept(); os._exit(0)
-    
-    def Power(self):
-        while True:
-            try:
-                if self.Btn_Connect.text()=="Disconnect": self.TCP.sendData(f"{cmd.CMD_POWER}{self.endChar}")
-                time.sleep(3)
-            except: break
-    
-    def recvmassage(self):
-            self.TCP.socket1_connect(self.h)
-            if not self.TCP.connect_Flag: return
-            self.power=Thread(target=self.Power); self.power.start()
-            restCmd=""
-            while self.TCP.connect_Flag:
-                try:
-                    Alldata=restCmd+str(self.TCP.recvData())
-                    if Alldata=="": break
-                    cmdArray=Alldata.split("\n")
-                    restCmd = cmdArray.pop() if cmdArray[-1] != "" else ""
-                    for oneCmd in cmdArray:
-                        Massage=oneCmd.split("#")
-                        if cmd.CMD_POWER in Massage and len(Massage) > 1:
-                            try:
-                                val = float(Massage[1])
-                                p = int((val - 7.0) / 1.4 * 100) if val >= 7 else 0
-                                power_value = min(p, 100)
-                                self.progress_Power.setValue(power_value)
-                                self.update_battery_style(power_value)
-                            except: pass
-                except: break
+            self.TCP.StopTcpcClient()
+        except:
+            pass
+        event.accept()
+        os._exit(0)
+
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    window = mywindow()
-    window.show()
+    w = mywindow()
+    w.show()
     sys.exit(app.exec_())
