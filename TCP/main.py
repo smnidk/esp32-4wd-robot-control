@@ -34,11 +34,7 @@ class RadarMapWidget(QWidget):
         self.robot_angle = 90.0 # в градусах (90 - смотрит строго вверх)
 
     def add_point(self, distance, sensor_angle=90):
-        # ВРЕМЕННЫЙ ТЕСТ: Выводим в консоль все входящие на карту точки
-        print(f"[MAP] Проверка точки: Дистанция={distance} см, Угол={sensor_angle}°")
-
         if distance <= 4 or distance >= 250: 
-            print(f"[MAP] ❌ Точка отклонена фильтром диапазона (4 < {distance} < 250)")
             return
 
         self.mutex.lock()
@@ -60,28 +56,17 @@ class RadarMapWidget(QWidget):
             self.points.append((gx, gy))
             if len(self.points) > 250: 
                 self.points.pop(0)
-            print(f"[MAP] 🟢 Точка успешно добавлена! Всего в базе: {len(self.points)}")
-        else:
-            print("[MAP] 🟡 Точка отклонена фильтром дубликатов (слишком близко к прошлой)")
                 
         self.mutex.unlock()
         self.update()
 
     def move_robot(self, linear_speed, angular_speed):
-        """
-        Изменяет виртуальные координаты робота при движении.
-        Вызывается по таймеру, пока зажаты кнопки движения.
-        """
         self.mutex.lock()
-        # Изменяем угол (поворот)
         self.robot_angle += angular_speed
-        
-        # Считаем смещение по осям X и Y (вперед/назад)
         rad = math.radians(self.robot_angle)
         self.robot_x += linear_speed * math.cos(rad)
         self.robot_y += linear_speed * math.sin(rad)
         self.mutex.unlock()
-        
         self.update()
 
     def clear_map(self):
@@ -102,45 +87,38 @@ class RadarMapWidget(QWidget):
             painter.setBrush(QColor(30, 30, 30))
             painter.drawRoundedRect(self.rect(), 10, 10)
 
-            # Центр экрана (куда мы поместим текущую позицию робота)
             cx = self.width() // 2
             cy = int(self.height() * 0.75)
-
             scale = min(self.width() / (self.max_distance * 2), self.height() / self.max_distance)
 
             self.mutex.lock()
-            # Отрисовка сетки дальномера (теперь она привязана к текущему положению робота)
+            # Отрисовка сетки дальномера
             painter.setPen(QPen(QColor(0, 255, 0, 35), 1, Qt.DashLine))
             for r_cm in [50, 100, 150, 200, 250]:
                 r_px = int(r_cm * scale)
                 painter.drawEllipse(QPoint(cx, cy), r_px, r_px)
 
-            # Отрисовка всех сохраненных глобальных точек относительно текущего положения робота
+            # Отрисовка сохраненных точек
             painter.setBrush(QBrush(QColor(255, 60, 60, 200)))
             painter.setPen(Qt.NoPen)
             
-            # Направление взгляда робота для трансформации координат
             current_rad = math.radians(self.robot_angle - 90)
             cos_a = math.cos(current_rad)
             sin_a = math.sin(current_rad)
 
             for gx, gy in self.points:
-                # Находим относительное смещение точки от робота в глобальных см
                 dx = gx - self.robot_x
                 dy = gy - self.robot_y
-
-                # Поворачиваем систему координат, чтобы карта крутилась вслед за роботом
                 rx = dx * cos_a + dy * sin_a
                 ry = -dx * sin_a + dy * cos_a
 
-                # Переводим в пиксели экрана
                 sx = cx + int(rx * scale)
                 sy = cy - int(ry * scale)
 
                 if self.rect().contains(sx, sy):
                     painter.drawEllipse(sx - 2, sy - 2, 4, 4)
 
-            # Нанесение линий между близкими точками контура преграды
+            # Отрисовка линий контура
             painter.setPen(QPen(QColor(255, 30, 30, 120), 1, Qt.SolidLine))
             for i in range(len(self.points) - 1):
                 x1, y1 = self.points[i]
@@ -161,11 +139,11 @@ class RadarMapWidget(QWidget):
                         painter.drawLine(ex1, ey1, ex2, ey2)
             self.mutex.unlock()
 
-            # Маркер направления робота (стрелочка/луч направления)
+            # Маркер направления
             painter.setPen(QPen(QColor(0, 255, 0, 100), 1.5, Qt.SolidLine))
             painter.drawLine(cx, cy, cx, cy - 30)
 
-            # Маркер самого робота в центре локальной системы координат
+            # Маркер самого робота
             painter.setBrush(QBrush(QColor(0, 150, 255)))
             painter.setPen(QPen(Qt.white, 1.5))
             painter.drawEllipse(QPoint(cx, cy), 6, 6)
@@ -179,7 +157,11 @@ class mywindow(QWidget, Ui_Client):
         super().__init__()
         self.setupUi(self)
 
-        # 1. СТИЛИЗАЦИЯ ИНТЕРФЕЙСА (Тёмная тема)
+        # Скрываем неиспользуемые кнопки по умолчанию напрямую
+        if hasattr(self, 'Light'): self.Light.hide()
+        if hasattr(self, 'Track'): self.Track.hide()
+
+        # Тёмная тема оформления
         self.setStyleSheet("""
             QWidget {
                 background-color: #1e1e24;
@@ -213,38 +195,35 @@ class mywindow(QWidget, Ui_Client):
             }
         """)
 
-        # 2. РАДИКАЛЬНОЕ УДАЛЕНИЕ НАДПИСИ FREENOVE И ПЕРЕИМЕНОВАНИЕ
         self.setWindowTitle("ESP32 Robot Control Station")
 
+        # Удаление упоминаний Freenove из интерфейса
         for widget in self.findChildren(QLabel):
             if "Freenove" in widget.text():
                 widget.setText("")
                 widget.hide()
 
-        # 3. ОБЩАЯ СЕТКА МАКЕТА
+        # Геометрия интерфейса
         MARGIN = 15
         WIN_W, WIN_H = 820, 660
-
         self.resize(WIN_W, WIN_H)
         self.setMinimumSize(WIN_W, WIN_H)
 
-        TOP_Y, TOP_H = 45, 330               # верхняя зона: видео + радар
-        LEFT_X, LEFT_W = MARGIN, 415          # левая колонка
-        RIGHT_X = LEFT_X + LEFT_W + MARGIN    # = 445
-        RIGHT_W = WIN_W - RIGHT_X - MARGIN    # = 360
+        TOP_Y, TOP_H = 45, 330
+        LEFT_X, LEFT_W = MARGIN, 415
+        RIGHT_X = LEFT_X + LEFT_W + MARGIN
+        RIGHT_W = WIN_W - RIGHT_X - MARGIN
 
-        ROW2_Y, ROW2_H = TOP_Y + TOP_H + MARGIN, 35     # кнопки записи/подключения
-        ROW3_Y = ROW2_Y + ROW2_H + 20                    # D-pad'ы
-        ROW4_Y = ROW3_Y + 140                            # слайдеры / батарея
+        ROW2_Y, ROW2_H = TOP_Y + TOP_H + MARGIN, 35
+        ROW3_Y = ROW2_Y + ROW2_H + 20
+        ROW4_Y = ROW3_Y + 140
 
-        # Заголовок по центру окна (если есть в UI)
         if hasattr(self, 'label_Title'):
             self.label_Title.setGeometry(MARGIN, 8, WIN_W - 2 * MARGIN, 28)
             self.label_Title.setAlignment(Qt.AlignCenter)
             self.label_Title.setText("ESP32 AUTOMOTIVE ROBOT SYSTEM")
             self.label_Title.setStyleSheet("font-size: 14px; font-weight: bold; color: #007acc; letter-spacing: 1px;")
 
-        # 4. ВЕРХНЯЯ ЗОНА: ВИДЕО (слева) + РАДАР (справа)
         self.label_Video.setGeometry(LEFT_X, TOP_Y, LEFT_W, TOP_H)
 
         self.radar_base_geom = (RIGHT_X, TOP_Y, RIGHT_W, TOP_H)
@@ -252,10 +231,8 @@ class mywindow(QWidget, Ui_Client):
         self.radar_map.setGeometry(*self.radar_base_geom)
         self.radar_map.show()
 
-        # 5. СТРОКА УПРАВЛЕНИЯ И ИСПРАВЛЕННАЯ КНОПКА ЗАПИСИ
         self.Btn_Video.setGeometry(LEFT_X + 210, ROW2_Y, LEFT_W - 210, ROW2_H)
 
-        # Центрируем уменьшенную кнопку записи (длина 180px) относительно правой панели радара
         rec_w = 180
         rec_x = RIGHT_X + (RIGHT_W - rec_w) // 2
         self.Btn_Record = QPushButton("Начать запись", self)
@@ -264,15 +241,13 @@ class mywindow(QWidget, Ui_Client):
 
         self.IP.setText("192.168.4.1")
         self.IP.setGeometry(LEFT_X, ROW2_Y, 95, ROW2_H)
-
         self.Btn_Connect.setGeometry(LEFT_X + 100, ROW2_Y, 110, ROW2_H)
 
-        # Отключаем ненужный функционал базовой платформы
         self.clear_led_interface()
-        self.Btn_Buzzer.hide()
-        self.Btn_Buzzer.setEnabled(False)
+        if hasattr(self, 'Btn_Buzzer'):
+            self.Btn_Buzzer.hide()
+            self.Btn_Buzzer.setEnabled(False)
 
-        # 6. D-PAD ДВИЖЕНИЯ (слева)
         cx1 = LEFT_X + LEFT_W // 2
         FB_W, FB_H = 100, 35
         TURN_W = 130
@@ -282,7 +257,6 @@ class mywindow(QWidget, Ui_Client):
         self.Btn_Turn_Right.setGeometry(cx1 + FB_W // 2 + 10, ROW3_Y + 45, TURN_W, FB_H)
         self.Btn_BackWard.setGeometry(cx1 - FB_W // 2, ROW3_Y + 90, FB_W, FB_H)
 
-        # 7. D-PAD КАМЕРЫ (справа)
         cx2 = RIGHT_X + RIGHT_W // 2
         CAM_W, CAM_H = 90, 32
 
@@ -295,8 +269,6 @@ class mywindow(QWidget, Ui_Client):
         self.servo1 = 90
         self.servo2 = 90
 
-        # 8. НИЖНЯЯ ЗОНА: ИСПРАВЛЕННЫЙ АККУРАТНЫЙ ИНДИКАТОР БАТАРЕИ
-        # Длина уменьшена до 180px, расположен симметрично под D-pad'ом движения
         bat_w = 180
         bat_x = cx1 - (bat_w // 2)
 
@@ -313,33 +285,27 @@ class mywindow(QWidget, Ui_Client):
                 text-align: center;
             }
             QProgressBar::chunk {
-                background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #00cc44, stop:1 #00ff66);
+                background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0, stop:0 #00cc44, stop:1 #00ff66);
                 border-radius: 4px;
                 margin: 1px;
             }
         """)
 
-        # Точное позиционирование графического наконечника ("плюса") батарейки справа
         self.battery_tip = QLabel(self)
         self.battery_tip.setGeometry(bat_x + bat_w, ROW4_Y + (35 - 19) // 2, 8, 19)
         self.battery_tip.setStyleSheet("background-color: #555566; border-radius: 1px;")
         self.battery_tip.show()
 
-        # Горизонтальный слайдер
         self.HSlider_Servo1.setGeometry(cx2 - CAM_W // 2 - 10 - CAM_W, ROW4_Y, 210, 28)
         self.HSlider_Servo1.setValue(self.servo1)
-
         self.label_Servo1.setGeometry(cx2 - CAM_W // 2 - 10 - CAM_W + 220, ROW4_Y - 4, 70, 28)
 
-        # Вертикальный слайдер
+        # Индикатор угла перенесен НАВЕРХ слайдера (на противоположную сторону)
         self.VSlider_Servo2.setGeometry(WIN_W - MARGIN - 20, ROW3_Y, 20, 166)
         self.VSlider_Servo2.setValue(self.servo2)
-
         self.label_Servo2.setGeometry(WIN_W - MARGIN - 70, ROW3_Y - 5, 50, 26)
         self.label_Servo2.setAlignment(Qt.AlignCenter)
 
-        # Системные переменные
         self.running = True
         self.original_size = self.size()
         self.aspect_ratio = self.original_size.width() / self.original_size.height()
@@ -349,7 +315,10 @@ class mywindow(QWidget, Ui_Client):
         self.TCP = VideoStreaming()
         self.connect_signals()
 
-        # Инициализация таймеров и потоков
+        # БЕЗОПАСНЫЙ ТАЙМЕР ДЛЯ БАТАРЕИ (Вместо зависающего фонового потока)
+        self.battery_timer = QTimer(self)
+        self.battery_timer.timeout.connect(self.send_battery_request)
+
         self.odometry_timer = QTimer(self)
         self.odometry_timer.timeout.connect(self.update_odometry)
         self.odometry_timer.start(50)
@@ -416,16 +385,29 @@ class mywindow(QWidget, Ui_Client):
     def set_movement(self, lin, ang, m1, m2, m3, m4):
         self.current_linear_speed = lin
         self.current_angular_speed = ang
-        self.TCP.sendData(f"{cmd.CMD_MOTOR}#{m1}#{m2}#{m3}#{m4}\n")
+        try:
+            self.TCP.sendData(f"{cmd.CMD_MOTOR}#{m1}#{m2}#{m3}#{m4}\n")
+        except:
+            pass
 
     def stop_movement(self):
         self.current_linear_speed = 0.0
         self.current_angular_speed = 0.0
-        self.TCP.sendData(f"{cmd.CMD_MOTOR}#0#0#0#0\n")
+        try:
+            self.TCP.sendData(f"{cmd.CMD_MOTOR}#0#0#0#0\n")
+        except:
+            pass
 
     def update_odometry(self):
         if self.current_linear_speed != 0.0 or self.current_angular_speed != 0.0:
             self.radar_map.move_robot(self.current_linear_speed, self.current_angular_speed)
+
+    def send_battery_request(self):
+        if "Отключить" in self.Btn_Connect.text():
+            try:
+                self.TCP.sendData(f"{cmd.CMD_POWER}\n")
+            except:
+                self.battery_timer.stop()
 
     def toggle_connection(self):
         if "Подключить" in self.Btn_Connect.text() or "Connect" in self.Btn_Connect.text():
@@ -436,8 +418,10 @@ class mywindow(QWidget, Ui_Client):
                 self.recv_thread = Thread(target=self.recv_data_loop, args=(ip,), daemon=True)
                 self.recv_thread.start()
                 self.Btn_Connect.setText("Отключить")
+                self.battery_timer.start(3000) # Опрос батареи каждые 3 секунды
         else:
             self.Btn_Connect.setText("Подключить")
+            self.battery_timer.stop()
             self.TCP.StopTcpcClient()
 
     def toggle_video(self):
@@ -458,25 +442,31 @@ class mywindow(QWidget, Ui_Client):
             if "Отключить" in self.Btn_Connect.text():
                 output_path = self.TCP.start_recording()
                 self.Btn_Record.setText("Остановить запись")
-                print(f"Запись начата: {output_path}")
             else:
                 QMessageBox.information(self, "Запись", "Сначала подключитесь к роботу")
         else:
             output_path = self.TCP.stop_recording()
             self.Btn_Record.setText("Начать запись")
-            if output_path:
-                print(f"Запись остановлена: {output_path}")
+
+    @pyqtSlot(int)
+    def update_battery_ui(self, val):
+        """Безопасное обновление стилей прогресс-бара в Главном Потоке"""
+        self.progress_Power.setValue(val)
+        if val < 20:
+            color_qss = "QProgressBar::chunk { background-color: #ff3333; border-radius: 4px; }"
+        elif val < 50:
+            color_qss = "QProgressBar::chunk { background-color: #ffaa00; border-radius: 4px; }"
+        else:
+            color_qss = "QProgressBar::chunk { background-color: #00ff66; border-radius: 4px; }"
+
+        self.progress_Power.setStyleSheet("""
+            QProgressBar { border: 2px solid #555566; border-radius: 6px; background-color: #111116; color: white; font-weight: bold; text-align: center; }
+        """ + color_qss)
 
     def recv_data_loop(self, ip):
         self.TCP.socket1_connect(ip)
-
-        def battery_ping():
-            while "Отключить" in self.Btn_Connect.text():
-                self.TCP.sendData(f"{cmd.CMD_POWER}\n")
-                time.sleep(3)
-        Thread(target=battery_ping, daemon=True).start()
-
         rest_buffer = ""
+        
         while "Отключить" in self.Btn_Connect.text():
             try:
                 data = self.TCP.recvData()
@@ -485,7 +475,11 @@ class mywindow(QWidget, Ui_Client):
 
                 complete_data = rest_buffer + data
                 lines = complete_data.split("\n")
-                rest_buffer = lines.pop() if lines[-1] != "" else ""
+                
+                if len(lines) > 0 and complete_data and not complete_data.endswith("\n"):
+                    rest_buffer = lines.pop()
+                else:
+                    rest_buffer = ""
 
                 for line in lines:
                     line = line.strip()
@@ -508,21 +502,14 @@ class mywindow(QWidget, Ui_Client):
                             percentage = int(((v - 7.0) / 1.4) * 100)
                             val = max(0, min(percentage, 100))
 
-                            QMetaObject.invokeMethod(self.progress_Power, "setValue", Qt.QueuedConnection, Q_ARG(int, val))
-                            if val < 20:
-                                color_qss = "QProgressBar::chunk { background-color: #ff3333; border-radius: 4px; }"
-                            elif val < 50:
-                                color_qss = "QProgressBar::chunk { background-color: #ffaa00; border-radius: 4px; }"
-                            else:
-                                color_qss = "QProgressBar::chunk { background-color: #00ff66; border-radius: 4px; }"
-
-                            self.progress_Power.setStyleSheet("""
-                                QProgressBar { border: 2px solid #555566; border-radius: 6px; background-color: #111116; color: white; font-weight: bold; text-align: center; }
-                            """ + color_qss)
+                            # Передаем задачу изменения UI главному потоку через invokeMethod
+                            QMetaObject.invokeMethod(self, "update_battery_ui", Qt.QueuedConnection, Q_ARG(int, val))
                         except:
                             pass
             except:
                 break
+        
+        QMetaObject.invokeMethod(self.battery_timer, "stop", Qt.QueuedConnection)
 
     def adjust_servo(self, is_axis_x, diff):
         if is_axis_x:
@@ -542,8 +529,11 @@ class mywindow(QWidget, Ui_Client):
         self.servo2 = self.VSlider_Servo2.value()
         self.label_Servo1.setText(str(self.servo1))
         self.label_Servo2.setText(str(self.servo2))
-        self.TCP.sendData(f"{cmd.CMD_SERVO}#0#{180 - self.servo1}\n")
-        self.TCP.sendData(f"{cmd.CMD_SERVO}#1#{self.servo2}\n")
+        try:
+            self.TCP.sendData(f"{cmd.CMD_SERVO}#0#{180 - self.servo1}\n")
+            self.TCP.sendData(f"{cmd.CMD_SERVO}#1#{self.servo2}\n")
+        except:
+            pass
 
     def update_video_loop(self):
         while self.running:
@@ -571,6 +561,7 @@ class mywindow(QWidget, Ui_Client):
     def closeEvent(self, event):
         self.running = False
         try:
+            self.battery_timer.stop()
             self.TCP.StopTcpcClient()
         except:
             pass
