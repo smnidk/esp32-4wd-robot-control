@@ -1,75 +1,40 @@
-## Freenove 4WD Car Kit for ESP32
+# ESP32 4WD Robot Control Station
 
-> A 4WD car kit for ESP32.
+Desktop control app and firmware extensions for an ESP32 4WD car, with
+obstacle detection and a simplified 2D map of the surroundings.
+Diploma project, Astana Polytechnic, 2026.
 
-<img src='Picture/icon.png' width='30%'/>
+> **Based on** the [Freenove 4WD Car Kit for ESP32](https://github.com/Freenove/Freenove_4WD_Car_Kit_for_ESP32)
+> (hardware, base firmware and base client). Released under
+> CC BY-NC-SA 3.0, same as the original. Freenove name and logo are
+> trademarks of Freenove Creative Technology Co., Ltd.
 
-### Download
+## What I added
 
-* **Use command in console**
+- **Safety stop** (`06_3_Multi_Functional_Car.ino`): the car stops forward
+  motion when an obstacle is closer than 15 cm; checked every 60 ms and
+  before each motor command.
+- **Distance filtering**: 5 ultrasonic readings per measurement, invalid
+  values discarded, minimum taken.
+- **Telemetry**: distance sent to the desktop app over TCP every 300 ms.
+- **2D map widget** (`main.py`, `RadarMapWidget`): converts distance and
+  sensor angle to coordinates, estimates robot position from motion
+  commands (no encoders, so the map drifts), removes duplicate points,
+  thread-safe drawing with PyQt5.
+- Dark UI theme, battery level indicator.
 
-	Run following command to download all the files in this repository.
+## What comes from the kit
 
-	`git clone https://github.com/Freenove/Freenove_4WD_Car_Kit_for_ESP32.git`
+Motor, LED, servo and camera libraries (`Freenove_4WD_Car_*`),
+`Command.py`, `Client_Ui.py`, `Video.py`.
 
-* **Manually download in browser**
+## Run
 
-	Click the green "Clone or download" button, then click "Download ZIP" button in the pop-up window.
-	Do NOT click the "Open in Desktop" button, it will lead you to install Github software.
+1. Open the `.ino` in Arduino IDE, set your Wi-Fi in `WiFi_Init()`.
+2. `pip install PyQt5 opencv-python numpy`
+3. `python main.py`, enter the robot's IP, press Connect.
 
-> If you meet any difficulties, please contact our support team for help.
+## Limitations
 
-### Support
-
-Freenove provides free and quick customer support. Including but not limited to:
-
-* Quality problems of products
-* Using Problems of products
-* Questions of learning and creation
-* Opinions and suggestions
-* Ideas and thoughts
-
-Please send an email to:
-
-[support@freenove.com](mailto:support@freenove.com)
-
-We will reply to you within one working day.
-
-### Purchase
-
-Please visit the following page to purchase our products:
-
-http://store.freenove.com
-
-Business customers please contact us through the following email address:
-
-[sale@freenove.com](mailto:sale@freenove.com)
-
-### Copyright
-
-All the files in this repository are released under [Creative Commons Attribution-NonCommercial-ShareAlike 3.0 Unported License](http://creativecommons.org/licenses/by-nc-sa/3.0/).
-
-![markdown](https://i.creativecommons.org/l/by-nc-sa/3.0/88x31.png)
-
-This means you can use them on your own derived works, in part or completely. But NOT for the purpose of commercial use.
-You can find a copy of the license in this repository.
-
-Freenove brand and logo are copyright of Freenove Creative Technology Co., Ltd. Can't be used without formal permission.
-
-
-### About
-
-Freenove is an open-source electronics platform.
-
-Freenove is committed to helping customer quickly realize the creative idea and product prototypes, making it easy to get started for enthusiasts of programing and electronics and launching innovative open source products.
-
-Our services include:
-
-* Robot kits
-* Learning kits for Arduino, Raspberry Pi and micro:bit
-* Electronic components and modules, tools
-* Product customization service
-
-Our code and circuit are open source. You can obtain the details and the latest information through visiting the following web site:
-
-http://www.freenove.com
+Position is estimated from commanded speed, not measured; the map is
+approximate. Distance measurement blocks the main loop for up to ~100 ms.
