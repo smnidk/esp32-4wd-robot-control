@@ -118,8 +118,8 @@ void Custom_Car_Select(int mode) {
 
 // -------------------- WIFI --------------------
 void WiFi_Init() {
-  ssid_Router     = (char*)"Redmi Note 11";    
-  password_Router = (char*)"prl_dswp";    
+  ssid_Router     = (char*)"YOUR_SSID";    
+  password_Router = (char*)"YOUR_PASSWOR";    
   ssid_AP         = (char*)"Sunshine";    
   password_AP     = (char*)"Sunshine";    
   frame_size      = FRAMESIZE_CIF;
